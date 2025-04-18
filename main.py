@@ -16,46 +16,209 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix='!', intents=intents)
+bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
 # Song queue per guild
 song_queues = {}
+# Elevator music enabled per guild
+
+elevator_enabled = {}
+
+def is_elevator_enabled(ctx):
+    # Default to True if not set
+    return elevator_enabled.get(ctx.guild.id, True)
 
 # Helper to get the queue for a guild
 def get_queue(ctx):
     return song_queues.setdefault(ctx.guild.id, [])
 
-# Helper to play the next song in the queue
+# Elevator music fallback implementation
 import asyncio
+
+ELEVATOR_MUSIC_PATH = "elevator.mp3"
+TTS_DONE_PATH = "done.mp3"
+
+async def play_elevator_music(ctx):
+    # Check if elevator music is enabled for this guild
+    if not is_elevator_enabled(ctx):
+        return
+    # Play TTS message first
+    if ctx.voice_client:
+        source = discord.FFmpegPCMAudio(TTS_DONE_PATH)
+        ctx.voice_client.play(source)
+        while ctx.voice_client.is_playing():
+            await asyncio.sleep(1)
+    # Then play elevator music on loop at low volume
+    while not get_queue(ctx):
+        if not is_elevator_enabled(ctx):
+            break
+        if ctx.voice_client and not ctx.voice_client.is_playing():
+            source = discord.FFmpegPCMAudio(ELEVATOR_MUSIC_PATH)
+            source = discord.PCMVolumeTransformer(source, volume=0.05)
+            ctx.voice_client.play(source)
+        await asyncio.sleep(5)
+        # If a new song is queued, break and play the song
+        if get_queue(ctx):
+            ctx.voice_client.stop()
+            break
 
 def play_next(ctx):
     queue = get_queue(ctx)
+    # Cancel elevator music if running
+    if hasattr(ctx.bot, 'elevator_task') and ctx.bot.elevator_task:
+        ctx.bot.elevator_task.cancel()
+        ctx.bot.elevator_task = None
     if hasattr(ctx.bot, 'disconnect_task') and ctx.bot.disconnect_task:
         ctx.bot.disconnect_task.cancel()
         ctx.bot.disconnect_task = None
     if queue:
         next_query = queue.pop(0)
         ctx.bot.last_query = next_query
-        ctx.bot.loop.create_task(play_song(ctx, next_query))
+        ctx.bot.loop.create_task(play_next_with_delay(ctx, next_query))
+        # Cancel disconnect timer if music starts
+        if hasattr(ctx.bot, 'disconnect_task') and ctx.bot.disconnect_task:
+            ctx.bot.disconnect_task.cancel()
+            ctx.bot.disconnect_task = None
     else:
-        # Wait 5 minutes before disconnecting
-        async def delayed_disconnect():
-            await asyncio.sleep(300)
-            if ctx.voice_client and not get_queue(ctx):
-                await ctx.voice_client.disconnect()
-                channel = ctx.channel
-                embed = discord.Embed(title="👋 Left Voice Channel", description="No songs were queued for 5 minutes. Disconnected to save resources.", color=discord.Color.orange())
-                await channel.send(embed=embed)
-        ctx.bot.disconnect_task = ctx.bot.loop.create_task(delayed_disconnect())
+        # Start elevator music fallback only if enabled
+        if is_elevator_enabled(ctx) and not getattr(ctx.bot, 'prevent_fallback', False):
+            ctx.bot.elevator_task = ctx.bot.loop.create_task(play_elevator_music(ctx))
+        else:
+            # Elevator is disabled: start a 5-minute disconnect timer
+            ctx.bot.disconnect_task = ctx.bot.loop.create_task(disconnect_after_timeout(ctx, 300))
+
+# Disconnect after timeout if still idle
+async def disconnect_after_timeout(ctx, timeout):
+    await asyncio.sleep(timeout)
+    voice = discord.utils.get(ctx.bot.voice_clients, guild=ctx.guild)
+    if voice and (not get_queue(ctx)) and not is_elevator_enabled(ctx):
+        await voice.disconnect()
+        logging.getLogger("sonix_playback").info(f"[Sonix] Disconnected from {ctx.guild.name} after 5 minutes of inactivity.")
+
+import asyncio
+async def play_next_with_delay(ctx, next_query):
+    await asyncio.sleep(1)
+    await play_song(ctx, next_query)
+
+# Preload the next song in the queue for instant transitions
+def get_next_query(ctx):
+    queue = get_queue(ctx)
+    if queue:
+        return queue[0]
+    return None
+
+async def preload_next_song(ctx):
+    next_query = get_next_query(ctx)
+    if not next_query:
+        return
+    import re
+    is_search = not (isinstance(next_query, str) and re.match(r"https?://", next_query))
+    ydl_opts = {
+        'format': 'bestaudio',
+        'noplaylist': True,
+        'quiet': True,
+        'default_search': 'ytsearch' if is_search else None,
+        'outtmpl': 'song.%(ext)s',
+    }
+    # Only preload if not already cached
+    if not get_cached_ytdlp(next_query):
+        loop = asyncio.get_running_loop()
+        try:
+            audio_url, title, info = await loop.run_in_executor(
+                process_pool, functools.partial(ytdlp_extract, next_query, ydl_opts)
+            )
+            set_cached_ytdlp(next_query, (audio_url, title, info))
+            logging.getLogger("sonix_playback").info(f"[Sonix] Preloaded next song: {title}")
+        except Exception as e:
+            logging.getLogger("sonix_playback").error(f"[Sonix] Error preloading next song: {e}")
+
+# Command to enable/disable elevator music
+@bot.command()
+async def elevator(ctx, mode: str = None):
+    """Enable or disable elevator music fallback. Usage: !elevator [on/off/status]"""
+    gid = ctx.guild.id
+    if mode is None or mode.lower() == "status":
+        status = "enabled" if is_elevator_enabled(ctx) else "disabled"
+        await ctx.send(f"Elevator music is currently **{status}** for this server.")
+    elif mode.lower() in ["on", "enable"]:
+        elevator_enabled[gid] = True
+        await ctx.send("Elevator music **enabled** for this server!")
+    elif mode.lower() in ["off", "disable"]:
+        elevator_enabled[gid] = False
+        await ctx.send("Elevator music **disabled** for this server!")
+        # Stop elevator music if currently playing
+        if hasattr(ctx.bot, 'elevator_task') and ctx.bot.elevator_task:
+            ctx.bot.elevator_task.cancel()
+            ctx.bot.elevator_task = None
+        if ctx.voice_client and ctx.voice_client.is_playing():
+            ctx.voice_client.stop()
+    else:
+        await ctx.send("Usage: !elevator [on/off/status]")
+
+# Custom help command for Sonix
+@bot.command(aliases=["m!help", "m!h", "?help", "?h"])
+async def sonixhelp(ctx):
+    embed = discord.Embed(title="Sonix Music Bot Help", color=discord.Color.blue())
+    embed.description = (
+        "**Prefix:** `!` or `m!` or `?`\n"
+        "Here are the available commands and their aliases:"
+    )
+    embed.add_field(name="▶️ Play", value="`!play <song/url>` or `!p` or `m!p` — Play a song or add to the queue.", inline=False)
+    embed.add_field(name="📄 Queue", value="`!queue` or `!q` or `m!q` — Show the current song queue.", inline=False)
+    embed.add_field(name="⏭️ Skip", value="`!skip` or `!s` or `m!s` — Skip the current song.", inline=False)
+    embed.add_field(name="⏸️ Pause", value="`!pause` or `!pa` or `m!pa` — Pause playback.", inline=False)
+    embed.add_field(name="▶️ Resume", value="`!resume` or `!r` or `m!r` — Resume playback.", inline=False)
+    embed.add_field(name="⏹️ Stop", value="`!stop` or `!st` or `m!st` — Stop playback and clear the queue.", inline=False)
+    embed.add_field(name="🔊 Join", value="`!join` or `!j` or `m!j` — Make the bot join your voice channel.", inline=False)
+    embed.add_field(name="🎵 Elevator Music", value="`!elevator [on/off/status]` — Enable or disable elevator music fallback.", inline=False)
+    embed.add_field(name="❓ Help", value="`!sonixhelp` or `!m!help` or `!m!h` or `?help` or `?h` — Show this help message.", inline=False)
+    embed.set_footer(text="Thank you for using Sonix! Need help? Contact support@sonixbot.com")
+    await ctx.send(embed=embed)
 
 # Helper to play a song (used for both play and next)
-async def play_song(ctx, query, retry_count=0):
+import functools
+import concurrent.futures
+from collections import OrderedDict
+
+# Global process pool for yt-dlp
+process_pool = concurrent.futures.ProcessPoolExecutor(max_workers=4)
+
+# Simple LRU cache for yt-dlp results (max 128 unique queries)
+ytdlp_cache = OrderedDict()
+YTDLP_CACHE_SIZE = 128
+
+def get_cached_ytdlp(query):
+    if query in ytdlp_cache:
+        ytdlp_cache.move_to_end(query)
+        return ytdlp_cache[query]
+    return None
+
+def set_cached_ytdlp(query, value):
+    ytdlp_cache[query] = value
+    ytdlp_cache.move_to_end(query)
+    if len(ytdlp_cache) > YTDLP_CACHE_SIZE:
+        ytdlp_cache.popitem(last=False)
+
+# Move ytdlp_extract to module level so it can be pickled for ProcessPoolExecutor
+
+def ytdlp_extract(query, ydl_opts):
     from yt_dlp import YoutubeDL
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(query, download=False)
+        if 'entries' in info:
+            info = info['entries'][0]
+        audio_url = info['url']
+        title = info.get('title', 'Unknown Title')
+        return audio_url, title, info
+
+async def play_song(ctx, query, retry_count=0):
+    # Cancel elevator music if running
+    if hasattr(ctx.bot, 'elevator_task') and ctx.bot.elevator_task:
+        ctx.bot.elevator_task.cancel()
+        ctx.bot.elevator_task = None
     import re
     logger = logging.getLogger("sonix_playback")
-    # Detect if query is a YouTube Music URL
     is_ytmusic = isinstance(query, str) and re.match(r"https?://music\.youtube\.com/", query)
-    # If not a URL, treat as a search query
     is_search = not (isinstance(query, str) and re.match(r"https?://", query))
     ydl_opts = {
         'format': 'bestaudio',
@@ -64,32 +227,38 @@ async def play_song(ctx, query, retry_count=0):
         'default_search': 'ytsearch' if is_search else None,
         'outtmpl': 'song.%(ext)s',
     }
-    # For search queries, just use the plain string
-    actual_query = query
-    try:
-        logger.info(f"[Sonix] Attempting to extract info for: {actual_query}")
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(actual_query, download=False)
-            if 'entries' in info:
-                info = info['entries'][0]
-            audio_url = info['url']
-            title = info.get('title', 'Unknown Title')
-        logger.info(f"[Sonix] Successfully extracted: {title}")
-    except Exception as e:
-        logger.error(f"[Sonix] Error extracting info: {e}")
-        if retry_count < 1:
-            logger.info(f"[Sonix] Retrying extraction for: {actual_query}")
-            await play_song(ctx, query, retry_count=retry_count+1)
+
+    # Check cache first
+    cached = get_cached_ytdlp(query)
+    if cached:
+        audio_url, title, info = cached
+        logger.info(f"[Sonix] [CACHE] Successfully extracted: {title}")
+    else:
+        loop = asyncio.get_running_loop()
+        try:
+            audio_url, title, info = await loop.run_in_executor(
+                process_pool, functools.partial(ytdlp_extract, query, ydl_opts)
+            )
+            set_cached_ytdlp(query, (audio_url, title, info))
+            logger.info(f"[Sonix] Successfully extracted: {title}")
+        except Exception as e:
+            logger.error(f"[Sonix] Error extracting info: {e}")
+            if retry_count < 1:
+                logger.info(f"[Sonix] Retrying extraction for: {query}")
+                await play_song(ctx, query, retry_count=retry_count+1)
+                return
+            embed = discord.Embed(title="❌ Error", description=f"Could not play the requested song after retry.\n```{str(e)}```", color=discord.Color.red())
+            await ctx.send(embed=embed)
             return
-        embed = discord.Embed(title="❌ Error", description=f"Could not play the requested song after retry.\n```{str(e)}```", color=discord.Color.red())
-        await ctx.send(embed=embed)
-        return
+
     try:
         logger.info(f"[Sonix] Starting playback: {title}")
         source = await discord.FFmpegOpusAudio.from_probe(
             audio_url,
             options='-analyzeduration 0 -probesize 32'
         )
+        # Preload the next song in the queue
+        ctx.bot.loop.create_task(preload_next_song(ctx))
         async def handle_after_playing_error(err):
             channel = ctx.channel
             logger.error(f"[Sonix] Playback error: {err}")
@@ -311,27 +480,32 @@ async def queue(ctx):
         embed = discord.Embed(title="🎶 Song Queue", description="The queue is empty.", color=discord.Color.blurple())
         await ctx.send(embed=embed)
     else:
-        from yt_dlp import YoutubeDL
-        import functools
-        embed = discord.Embed(title="🎶 Song Queue", color=discord.Color.blurple())
-        max_display = 10
         async def get_metadata(q):
-            def fetch():
-                with YoutubeDL({'quiet': True, 'noplaylist': True}) as ydl:
-                    info = ydl.extract_info(q, download=False)
-                    if 'entries' in info:
-                        info = info['entries'][0]
-                    return info
-            try:
-                info = await asyncio.to_thread(fetch)
-                title = info.get('title', q)
-                url = info.get('webpage_url', q)
-                thumbnail = info.get('thumbnail')
-                return title, url, thumbnail
-            except Exception:
-                return q, q, None
+            # Use the same process pool and cache as playback
+            cached = get_cached_ytdlp(q)
+            if cached:
+                _, title, info = cached
+            else:
+                ydl_opts = {
+                    'format': 'bestaudio',
+                    'noplaylist': True,
+                    'quiet': True,
+                    'outtmpl': 'song.%(ext)s',
+                }
+                loop = asyncio.get_running_loop()
+                try:
+                    audio_url, title, info = await loop.run_in_executor(
+                        process_pool, functools.partial(ytdlp_extract, q, ydl_opts)
+                    )
+                    set_cached_ytdlp(q, (audio_url, title, info))
+                except Exception:
+                    return q, q, None
+            title = info.get('title', q)
+            url = info.get('webpage_url', q)
+            thumbnail = info.get('thumbnail')
+            return title, url, thumbnail
         fields = []
-        for i, q in enumerate(queue[:max_display]):
+        for i, q in enumerate(queue[:10]):
             # Only fetch metadata for real URLs (http/https), never for search queries or ytsearchmusic: etc
             if (
                 isinstance(q, str)
@@ -358,21 +532,78 @@ async def queue(ctx):
             embed.set_footer(text=f"Total songs in queue: {len(queue)}")
         await ctx.send(embed=embed)
 
-bot.remove_command('help')
+# The official help command is now !sonixhelp (with aliases), see above.
+# All blocking yt-dlp calls in queue and play_song use asyncio.to_thread to avoid lag.
 
-@bot.command()
-async def help(ctx):
-    """Shows all Sonix commands and features."""
-    embed = discord.Embed(title="🤖 Sonix Help", description="Here are all my commands:", color=discord.Color.blurple())
-    embed.add_field(name="!play <url or search>", value="Play a song from YouTube, Spotify, SoundCloud, etc. or search by name.", inline=False)
-    embed.add_field(name="!pause / !resume", value="Pause or resume the current song.", inline=False)
-    embed.add_field(name="!skip", value="Skip the current song.", inline=False)
-    embed.add_field(name="!replay", value="Replay the last played song.", inline=False)
-    embed.add_field(name="!stop", value="Stop the music and leave the voice channel.", inline=False)
-    embed.add_field(name="!queue", value="Show the current song queue.", inline=False)
-    embed.add_field(name="!join", value="Join your current voice channel.", inline=False)
-    embed.set_footer(text="Sonix • Discord Music Bot")
-    await ctx.send(embed=embed)
+# --- Track Last Command Channel ---
+
+@bot.before_invoke
+async def set_last_text_channel(ctx):
+    if ctx.guild:
+        setattr(bot, f'last_text_channel_{ctx.guild.id}', ctx.channel)
+
+# --- Voice State and Disconnect Handlers ---
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    # Only act if this is the bot itself
+    if member.id != bot.user.id:
+        return
+    # Find the last used text channel for this guild
+    channel = getattr(bot, f'last_text_channel_{member.guild.id}', None)
+    # 1. Pause music if server muted (not deafened), unpause if unmuted
+    voice = discord.utils.get(bot.voice_clients, guild=member.guild)
+    # If server muted (not deafened), pause
+    if (after.self_mute or after.mute) and after.channel is not None:
+        if voice and voice.is_playing():
+            voice.pause()
+        if channel:
+            embed = discord.Embed(
+                title="🔇 Server Muted",
+                description="I have been server muted and paused playback. Unmute me to resume music.",
+                color=discord.Color.orange()
+            )
+            await channel.send(embed=embed)
+    # If unmuted (was previously muted), unpause
+    elif (before.self_mute or before.mute) and not (after.self_mute or after.mute):
+        if voice and voice.is_paused():
+            voice.resume()
+        if channel:
+            embed = discord.Embed(
+                title="🔊 Server Unmuted",
+                description="I am no longer server muted and have resumed playback.",
+                color=discord.Color.green()
+            )
+            await channel.send(embed=embed)
+    # Do nothing on deafened/undeafened
+    # 2. On disconnect, clear queue and prevent fallback music
+    if before.channel and not after.channel:
+        # Clear the queue for this guild
+        if hasattr(bot, 'queues') and member.guild.id in bot.queues:
+            bot.queues[member.guild.id].clear()
+        # Cancel any elevator/done/disconnect tasks
+        if hasattr(bot, 'elevator_task') and bot.elevator_task:
+            bot.elevator_task.cancel()
+            bot.elevator_task = None
+        if hasattr(bot, 'disconnect_task') and bot.disconnect_task:
+            bot.disconnect_task.cancel()
+            bot.disconnect_task = None
+        # Set a flag to prevent fallback music
+        bot.prevent_fallback = True
+        if channel:
+            embed = discord.Embed(
+                title="👋 Disconnected from Voice",
+                description="I have been disconnected from voice and cleared the queue.",
+                color=discord.Color.red()
+            )
+            await channel.send(embed=embed)
+    else:
+        bot.prevent_fallback = False
+
+# In your play_next and disconnect logic, check bot.prevent_fallback before playing elevator/done music
+# Example modification for play_next:
+# if is_elevator_enabled(ctx) and not getattr(ctx.bot, 'prevent_fallback', False):
+#    ctx.bot.elevator_task = ctx.bot.loop.create_task(play_elevator_music(ctx))
 
 if __name__ == '__main__':
     bot.run(TOKEN)
