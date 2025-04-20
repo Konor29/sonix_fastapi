@@ -5,6 +5,8 @@ import re
 import logging
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
+import json
+import secrets
 
 SPOTIPY_CLIENT_ID = os.getenv('SPOTIPY_CLIENT_ID')
 SPOTIPY_CLIENT_SECRET = os.getenv('SPOTIPY_CLIENT_SECRET')
@@ -18,10 +20,45 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
-# Song queue per guild
-song_queues = {}
-# Elevator music enabled per guild
+# Persistent per-server keys
+guild_keys_path = 'guild_keys.json'
+if os.path.exists(guild_keys_path):
+    with open(guild_keys_path, 'r') as f:
+        guild_keys = json.load(f)
+else:
+    guild_keys = {}
 
+def save_guild_keys():
+    with open(guild_keys_path, 'w') as f:
+        json.dump(guild_keys, f)
+
+# Ensure every guild has a key
+def ensure_guild_key(guild_id):
+    gid = str(guild_id)
+    if gid not in guild_keys:
+        guild_keys[gid] = secrets.token_urlsafe(16)
+        save_guild_keys()
+    return guild_keys[gid]
+
+@bot.event
+async def on_guild_join(guild):
+    ensure_guild_key(guild.id)
+
+@bot.command()
+async def getkey(ctx):
+    key = ensure_guild_key(ctx.guild.id)
+    try:
+        await ctx.author.send(f"Your server's control key is: `{key}`\nKeep this secret!")
+        await ctx.reply("I've sent you the server key in a DM!", mention_author=False)
+    except discord.Forbidden:
+        await ctx.reply(f"Your server's control key is: `{key}`\n(Enable DMs to receive this privately)", mention_author=False)
+
+# Song queue per guild (list of dicts with metadata)
+song_queues = {}  # {guild_id: [song_dict, ...]}
+# Track now playing and last played per guild
+now_playing = {}  # {guild_id: song_dict}
+last_played = {}  # {guild_id: song_dict}
+# Elevator music enabled per guild
 elevator_enabled = {}
 
 def is_elevator_enabled(ctx):
@@ -32,6 +69,11 @@ def is_elevator_enabled(ctx):
 def get_queue(ctx):
     return song_queues.setdefault(ctx.guild.id, [])
 
+def add_to_queue(ctx, song):
+    # song is a dict with metadata
+    queue = get_queue(ctx)
+    queue.append(song)
+
 # Elevator music fallback implementation
 import asyncio
 
@@ -39,30 +81,45 @@ ELEVATOR_MUSIC_PATH = "elevator.mp3"
 TTS_DONE_PATH = "done.mp3"
 
 async def play_elevator_music(ctx):
-    # Check if elevator music is enabled for this guild
+    # Only play elevator music if enabled and nothing else is playing
     if not is_elevator_enabled(ctx):
         return
-    # Play TTS message first
-    if ctx.voice_client:
+    # Play TTS message first (optional, can remove if not needed)
+    if ctx.voice_client and not ctx.voice_client.is_playing():
         source = discord.FFmpegPCMAudio(TTS_DONE_PATH)
         ctx.voice_client.play(source)
         while ctx.voice_client.is_playing():
             await asyncio.sleep(1)
-    # Then play elevator music on loop at low volume
-    while not get_queue(ctx):
+    # Play elevator music on loop at low volume ONLY if queue is empty and nothing is playing
+    while True:
         if not is_elevator_enabled(ctx):
             break
+        # If a song is queued, stop elevator music immediately
+        if get_queue(ctx):
+            if ctx.voice_client and ctx.voice_client.is_playing():
+                ctx.voice_client.stop()
+            break
+        # If nothing is playing, play elevator music
         if ctx.voice_client and not ctx.voice_client.is_playing():
             source = discord.FFmpegPCMAudio(ELEVATOR_MUSIC_PATH)
             source = discord.PCMVolumeTransformer(source, volume=0.05)
             ctx.voice_client.play(source)
-        await asyncio.sleep(5)
-        # If a new song is queued, break and play the song
+        await asyncio.sleep(3)
+        # If a song is queued, stop elevator music immediately
         if get_queue(ctx):
-            ctx.voice_client.stop()
+            if ctx.voice_client and ctx.voice_client.is_playing():
+                ctx.voice_client.stop()
             break
 
+
 def play_next(ctx):
+    # Use a per-guild playback flag to prevent double starts
+    if not hasattr(ctx.bot, 'is_playing_flag'):
+        ctx.bot.is_playing_flag = {}
+    flag = ctx.bot.is_playing_flag.setdefault(ctx.guild.id, False)
+    if flag:
+        # Already playing, don't trigger again
+        return
     queue = get_queue(ctx)
     # Cancel elevator music if running
     if hasattr(ctx.bot, 'elevator_task') and ctx.bot.elevator_task:
@@ -72,19 +129,19 @@ def play_next(ctx):
         ctx.bot.disconnect_task.cancel()
         ctx.bot.disconnect_task = None
     if queue:
-        next_query = queue.pop(0)
-        ctx.bot.last_query = next_query
-        ctx.bot.loop.create_task(play_next_with_delay(ctx, next_query))
+        ctx.bot.is_playing_flag[ctx.guild.id] = True
+        ctx.bot.loop.create_task(play_next_with_delay(ctx))
         # Cancel disconnect timer if music starts
         if hasattr(ctx.bot, 'disconnect_task') and ctx.bot.disconnect_task:
             ctx.bot.disconnect_task.cancel()
             ctx.bot.disconnect_task = None
     else:
+        now_playing[ctx.guild.id] = None
+        ctx.bot.is_playing_flag[ctx.guild.id] = False
         # Start elevator music fallback only if enabled
         if is_elevator_enabled(ctx) and not getattr(ctx.bot, 'prevent_fallback', False):
             ctx.bot.elevator_task = ctx.bot.loop.create_task(play_elevator_music(ctx))
         else:
-            # Elevator is disabled: start a 5-minute disconnect timer
             ctx.bot.disconnect_task = ctx.bot.loop.create_task(disconnect_after_timeout(ctx, 300))
 
 # Disconnect after timeout if still idle
@@ -96,9 +153,19 @@ async def disconnect_after_timeout(ctx, timeout):
         logging.getLogger("sonix_playback").info(f"[Sonix] Disconnected from {ctx.guild.name} after 5 minutes of inactivity.")
 
 import asyncio
-async def play_next_with_delay(ctx, next_query):
+async def play_next_with_delay(ctx):
     await asyncio.sleep(1)
-    await play_song(ctx, next_query)
+    queue = get_queue(ctx)
+    if queue:
+        next_song = queue.pop(0)
+        # Track now playing and last played
+        last_played[ctx.guild.id] = now_playing.get(ctx.guild.id)
+        now_playing[ctx.guild.id] = next_song
+        await play_song(ctx, next_song)
+    else:
+        now_playing[ctx.guild.id] = None
+    # Don't clear flag here; only after playback is truly finished
+
 
 # Preload the next song in the queue for instant transitions
 def get_next_query(ctx):
@@ -123,14 +190,15 @@ async def preload_next_song(ctx):
     # Only preload if not already cached
     if not get_cached_ytdlp(next_query):
         loop = asyncio.get_running_loop()
-        try:
-            audio_url, title, info = await loop.run_in_executor(
-                process_pool, functools.partial(ytdlp_extract, next_query, ydl_opts)
-            )
+        result = await loop.run_in_executor(
+            process_pool, functools.partial(ytdlp_extract, next_query, ydl_opts)
+        )
+        if result:
+            audio_url, title, info = result
             set_cached_ytdlp(next_query, (audio_url, title, info))
             logging.getLogger("sonix_playback").info(f"[Sonix] Preloaded next song: {title}")
-        except Exception as e:
-            logging.getLogger("sonix_playback").error(f"[Sonix] Error preloading next song: {e}")
+        else:
+            logging.getLogger("sonix_playback").error(f"[Sonix] Error preloading next song: {next_query}")
 
 # Command to enable/disable elevator music
 @bot.command()
@@ -203,92 +271,261 @@ def set_cached_ytdlp(query, value):
 
 def ytdlp_extract(query, ydl_opts):
     from yt_dlp import YoutubeDL
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(query, download=False)
-        if 'entries' in info:
-            info = info['entries'][0]
-        audio_url = info['url']
-        title = info.get('title', 'Unknown Title')
-        return audio_url, title, info
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(query, download=False)
+            if 'entries' in info:
+                info = info['entries'][0]
+            audio_url = info.get('url')
+            title = info.get('title', query)
+            return audio_url, title, info
+    except Exception:
+        return None
 
-async def play_song(ctx, query, retry_count=0):
+async def fetch_song_metadata(q):
+    from yt_dlp import YoutubeDL
+    ydl_opts = {
+        'format': 'bestaudio',
+        'noplaylist': True,
+        'quiet': True,
+        'default_search': 'ytsearch',
+    }
+    def ytdlp_extract():
+        try:
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(q, download=False)
+                if 'entries' in info:
+                    info = info['entries'][0]
+                return info
+        except Exception:
+            return None  # Always return None on failure, never an exception or traceback
+    info = await asyncio.to_thread(ytdlp_extract)
+    if not info:
+        return None
+    return {
+        'title': info.get('title', q),
+        'webpage_url': info.get('webpage_url', q),
+        'thumbnail': info.get('thumbnail', ''),
+        'audio_url': info.get('url', ''),
+        'info': info,
+        'query': q,
+    }
+
+async def fetch_multiple_song_metadata(queries):
+    # Helper to fetch metadata for a list of queries in parallel
+    results = await asyncio.gather(*(fetch_song_metadata(q) for q in queries))
+    # Filter out None (failed) results
+    return [song for song in results if song is not None]
+
+async def expand_spotify_url_to_queries(spotify_url):
+    import re
+    import os
+    import spotipy
+    from spotipy.oauth2 import SpotifyClientCredentials
+    spotify_pattern = r"https://open\.spotify\.com/(track|album|playlist)/([a-zA-Z0-9]+)"
+    match = re.match(spotify_pattern, spotify_url)
+    if not match:
+        return None
+    client_id = os.getenv('SPOTIPY_CLIENT_ID')
+    client_secret = os.getenv('SPOTIPY_CLIENT_SECRET')
+    if not client_id or not client_secret:
+        return None
+    sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials())
+    link_type, spotify_id = match.groups()
+    queries = []
+    try:
+        if link_type == 'track':
+            track = sp.track(spotify_id)
+            queries = [f"{track['name']} {track['artists'][0]['name']}"]
+        elif link_type == 'album':
+            album = sp.album(spotify_id)
+            tracks = album['tracks']['items']
+            queries = [f"{t['name']} {t['artists'][0]['name']}" for t in tracks]
+        elif link_type == 'playlist':
+            playlist = sp.playlist(spotify_id)
+            tracks = playlist['tracks']['items']
+            for item in tracks:
+                t = item['track']
+                if t is not None:
+                    queries.append(f"{t['name']} {t['artists'][0]['name']}")
+    except Exception:
+        return None
+    # Fetch YouTube metadata for all queries
+    if not queries:
+        return None
+    songs = await fetch_multiple_song_metadata(queries)
+    return songs if songs else None
+
+async def play_song(ctx, query_or_song, retry_count=0):
     # Cancel elevator music if running
     if hasattr(ctx.bot, 'elevator_task') and ctx.bot.elevator_task:
         ctx.bot.elevator_task.cancel()
         ctx.bot.elevator_task = None
     import re
     logger = logging.getLogger("sonix_playback")
-    is_ytmusic = isinstance(query, str) and re.match(r"https?://music\.youtube\.com/", query)
-    is_search = not (isinstance(query, str) and re.match(r"https?://", query))
-    ydl_opts = {
-        'format': 'bestaudio',
-        'noplaylist': True,
-        'quiet': True,
-        'default_search': 'ytsearch' if is_search else None,
-        'outtmpl': 'song.%(ext)s',
-    }
-
-    # Check cache first
-    cached = get_cached_ytdlp(query)
-    if cached:
-        audio_url, title, info = cached
-        logger.info(f"[Sonix] [CACHE] Successfully extracted: {title}")
+    # If passed a dict (already extracted), use it directly
+    if isinstance(query_or_song, dict):
+        song = query_or_song
+        audio_url = song['audio_url']
+        title = song['title']
+        info = song['info']
+        is_ytmusic = song.get('is_ytmusic', False)
+        is_search = song.get('is_search', False)
+        query = song.get('query', None)
     else:
-        loop = asyncio.get_running_loop()
-        try:
-            audio_url, title, info = await loop.run_in_executor(
+        # If passed a Spotify URL, expand to YouTube search queries
+        spotify_pattern = r"https://open\.spotify\.com/(track|album|playlist)/([a-zA-Z0-9]+)"
+        match = re.match(spotify_pattern, str(query_or_song))
+        if match:
+            await ctx.send("🔎 Expanding Spotify link and searching YouTube for playable tracks. This may take a moment for large playlists...")
+            expanded = await expand_spotify_url_to_queries(str(query_or_song))
+            if not expanded:
+                await ctx.send("❌ Could not extract any playable tracks from this Spotify link.")
+                return
+            first, *rest = expanded
+            await ctx.send(f"▶️ Now playing: **{first['title']}** (from Spotify)")
+            await play_song(ctx, first)
+            queue = get_queue(ctx)
+            # Incrementally queue the rest in the background
+            async def queue_spotify_tracks(rest_tracks):
+                added = 0
+                for song in rest_tracks:
+                    queue.append(song)
+                    added += 1
+                    if added % 5 == 0 or added == len(rest_tracks):
+                        await ctx.send(f"➕ Added {added}/{len(rest_tracks)} tracks from the Spotify playlist to the queue.")
+                await ctx.send(f"✅ Finished adding {len(rest_tracks)} tracks from Spotify playlist to the queue!")
+            ctx.bot.loop.create_task(queue_spotify_tracks(rest))
+            return
+        query = query_or_song
+        is_ytmusic = isinstance(query, str) and re.match(r"https?://music\.youtube\.com/", query)
+        is_search = not (isinstance(query, str) and re.match(r"https?://", query))
+        ydl_opts = {
+            'format': 'bestaudio',
+            'noplaylist': True,
+            'quiet': True,
+            'default_search': 'ytsearch' if is_search else None,
+            'outtmpl': 'song.%(ext)s',
+        }
+        # Check cache first
+        cached = get_cached_ytdlp(query)
+        if cached:
+            audio_url, title, info = cached
+            logger.info(f"[Sonix] [CACHE] Successfully extracted: {title}")
+        else:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
                 process_pool, functools.partial(ytdlp_extract, query, ydl_opts)
             )
-            set_cached_ytdlp(query, (audio_url, title, info))
-            logger.info(f"[Sonix] Successfully extracted: {title}")
-        except Exception as e:
-            logger.error(f"[Sonix] Error extracting info: {e}")
-            if retry_count < 1:
-                logger.info(f"[Sonix] Retrying extraction for: {query}")
-                await play_song(ctx, query, retry_count=retry_count+1)
+            if result:
+                audio_url, title, info = result
+                set_cached_ytdlp(query, (audio_url, title, info))
+                logger.info(f"[Sonix] Successfully extracted: {title}")
+            else:
+                logger.error(f"[Sonix] Error extracting info: {query}")
+                if retry_count < 1:
+                    logger.info(f"[Sonix] Retrying extraction for: {query}")
+                    await play_song(ctx, query, retry_count=retry_count+1)
+                    return
+                embed = discord.Embed(title="❌ Error", description=f"Could not play the requested song after retry.", color=discord.Color.red())
+                await ctx.send(embed=embed)
                 return
-            embed = discord.Embed(title="❌ Error", description=f"Could not play the requested song after retry.\n```{str(e)}```", color=discord.Color.red())
+        # Build the song dict
+        song = {
+            'audio_url': audio_url,
+            'title': title,
+            'info': info,
+            'webpage_url': info.get('webpage_url', ''),
+            'thumbnail': info.get('thumbnail', ''),
+            'is_ytmusic': is_ytmusic,
+            'is_search': is_search,
+            'query': query,
+        }
+        # Add to queue if something is already playing
+        voice = ctx.voice_client
+        if voice and (voice.is_playing() or voice.is_paused()):
+            add_to_queue(ctx, song)
+            embed = discord.Embed(title="🎶 Queued", description=f"**[{title}]({info.get('webpage_url', '')})** was added to the queue.", color=discord.Color.blue())
+            if 'thumbnail' in info:
+                embed.set_thumbnail(url=info['thumbnail'])
             await ctx.send(embed=embed)
             return
-
     try:
-        logger.info(f"[Sonix] Starting playback: {title}")
+        logger.info(f"[Sonix] Starting playback: {song['title']}")
         source = await discord.FFmpegOpusAudio.from_probe(
-            audio_url,
+            song['audio_url'],
             options='-analyzeduration 0 -probesize 32'
         )
         # Preload the next song in the queue
         ctx.bot.loop.create_task(preload_next_song(ctx))
+        # Track now playing and last played
+        last_played[ctx.guild.id] = now_playing.get(ctx.guild.id)
+        now_playing[ctx.guild.id] = song
         async def handle_after_playing_error(err):
             channel = ctx.channel
             logger.error(f"[Sonix] Playback error: {err}")
             embed = discord.Embed(title="❌ Playback Error", description=f"There was an error during playback: ```{err}```\nSkipping to the next song.", color=discord.Color.red())
             await channel.send(embed=embed)
-
         def after_playing(err):
+            # Always clear the playback flag before triggering next
+            if hasattr(ctx.bot, 'is_playing_flag'):
+                ctx.bot.is_playing_flag[ctx.guild.id] = False
             if err:
                 logger.error(f"[Sonix] Error in after_playing: {err}")
                 ctx.bot.loop.create_task(handle_after_playing_error(err))
             else:
-                logger.info(f"[Sonix] Song finished: {title}")
+                logger.info(f"[Sonix] Song finished: {song['title']}")
             ctx.bot.loop.call_soon_threadsafe(play_next, ctx)
 
         ctx.voice_client.play(source, after=after_playing)
-        if is_ytmusic or (is_search and 'music.youtube.com' in info.get('webpage_url', '')):
-            embed = discord.Embed(title="🎶 Now Playing from YouTube Music", description=f"**[{title}]({info.get('webpage_url', '')})**", color=discord.Color.red())
+        if song['is_ytmusic'] or (song['is_search'] and 'music.youtube.com' in song['info'].get('webpage_url', '')):
+            embed = discord.Embed(title="🎶 Now Playing from YouTube Music", description=f"**[{song['title']}]({song['info'].get('webpage_url', '')})**", color=discord.Color.red())
         else:
-            embed = discord.Embed(title="🎶 Now Playing", description=f"**[{title}]({info.get('webpage_url', '')})**", color=discord.Color.green())
-        if 'thumbnail' in info:
-            embed.set_thumbnail(url=info['thumbnail'])
+            embed = discord.Embed(title="🎶 Now Playing", description=f"**[{song['title']}]({song['info'].get('webpage_url', '')})**", color=discord.Color.green())
+        if song['thumbnail']:
+            embed.set_thumbnail(url=song['thumbnail'])
         await ctx.send(embed=embed)
     except Exception as e:
         logger.error(f"[Sonix] Error starting playback: {e}")
         if retry_count < 1:
-            logger.info(f"[Sonix] Retrying playback for: {title}")
-            await play_song(ctx, query, retry_count=retry_count+1)
+            logger.info(f"[Sonix] Retrying playback for: {song['title']}")
+            await play_song(ctx, song, retry_count=retry_count+1)
             return
         embed = discord.Embed(title="❌ Error", description=f"Could not start playback after retry.\n```{str(e)}```", color=discord.Color.red())
         await ctx.send(embed=embed)
+
+def play_next(ctx):
+    # Use a per-guild playback flag to prevent double starts
+    if not hasattr(ctx.bot, 'is_playing_flag'):
+        ctx.bot.is_playing_flag = {}
+    flag = ctx.bot.is_playing_flag.setdefault(ctx.guild.id, False)
+    if flag:
+        # Already playing, don't trigger again
+        return
+    queue = get_queue(ctx)
+    # Cancel elevator music if running
+    if hasattr(ctx.bot, 'elevator_task') and ctx.bot.elevator_task:
+        ctx.bot.elevator_task.cancel()
+        ctx.bot.elevator_task = None
+    if hasattr(ctx.bot, 'disconnect_task') and ctx.bot.disconnect_task:
+        ctx.bot.disconnect_task.cancel()
+        ctx.bot.disconnect_task = None
+    if queue:
+        ctx.bot.is_playing_flag[ctx.guild.id] = True
+        ctx.bot.loop.create_task(play_next_with_delay(ctx))
+        # Cancel disconnect timer if music starts
+        if hasattr(ctx.bot, 'disconnect_task') and ctx.bot.disconnect_task:
+            ctx.bot.disconnect_task.cancel()
+            ctx.bot.disconnect_task = None
+    else:
+        now_playing[ctx.guild.id] = None
+        ctx.bot.is_playing_flag[ctx.guild.id] = False
+        # Only start elevator music if enabled, not prevented, and nothing is playing
+        if is_elevator_enabled(ctx) and not getattr(ctx.bot, 'prevent_fallback', False):
+            if ctx.voice_client and not ctx.voice_client.is_playing():
+                ctx.bot.elevator_task = ctx.bot.loop.create_task(play_elevator_music(ctx))
+        else:
+            ctx.bot.disconnect_task = ctx.bot.loop.create_task(disconnect_after_timeout(ctx, 300))
 
 @bot.event
 async def on_ready():
@@ -319,6 +556,13 @@ async def play(ctx, *, query):
     # Determine if the bot is already playing or paused
     is_playing = ctx.voice_client and (ctx.voice_client.is_playing() or ctx.voice_client.is_paused())
 
+
+    async def fetch_multiple_song_metadata(queries):
+        # Helper to fetch metadata for a list of queries in parallel
+        results = await asyncio.gather(*(fetch_song_metadata(q) for q in queries))
+        # Filter out None (failed) results
+        return [song for song in results if song is not None]
+
     if match:
         # Set up Spotify API
         client_id = os.getenv('SPOTIPY_CLIENT_ID')
@@ -333,75 +577,56 @@ async def play(ctx, *, query):
             if link_type == 'track':
                 track = sp.track(spotify_id)
                 search_query = f"{track['name']} {track['artists'][0]['name']}"
-                queue.append(search_query)
+                song = await fetch_song_metadata(search_query)
+                queue.append(song)
                 if is_playing:
-                    embed = discord.Embed(title="🟢 Added from Spotify", description=f"**{search_query}**", color=discord.Color.green())
+                    embed = discord.Embed(title="🟢 Added from Spotify", description=f"**{song['title']}**", color=discord.Color.green())
+                    if song['thumbnail']:
+                        embed.set_thumbnail(url=song['thumbnail'])
                     await ctx.send(embed=embed)
             elif link_type == 'album':
                 album = sp.album(spotify_id)
                 tracks = album['tracks']['items']
-                for t in tracks:
-                    search_query = f"{t['name']} {t['artists'][0]['name']}"
-                    queue.append(search_query)
-                if is_playing:
-                    embed = discord.Embed(title="🟢 Added Album from Spotify", description=f"Added **{len(tracks)}** tracks from album!", color=discord.Color.green())
+                queries = [f"{t['name']} {t['artists'][0]['name']}" for t in tracks]
+                songs = await fetch_multiple_song_metadata(queries)
+                if songs:
+                    queue.extend(songs)
+                    if is_playing:
+                        embed = discord.Embed(title="🟢 Added Album from Spotify", description=f"Added **{len(songs)}** tracks from album!", color=discord.Color.green())
+                        await ctx.send(embed=embed)
+                else:
+                    embed = discord.Embed(title="❌ Spotify Album Error", description="No playable tracks found in this Spotify album. All may be unavailable or blocked.", color=discord.Color.red())
                     await ctx.send(embed=embed)
             elif link_type == 'playlist':
                 playlist = sp.playlist(spotify_id)
                 tracks = playlist['tracks']['items']
-                count = 0
+                queries = []
                 for item in tracks:
                     t = item['track']
                     if t is not None:
-                        search_query = f"{t['name']} {t['artists'][0]['name']}"
-                        queue.append(search_query)
-                        count += 1
-                if is_playing:
-                    embed = discord.Embed(title="🟢 Added Playlist from Spotify", description=f"Added **{count}** tracks from playlist!", color=discord.Color.green())
+                        queries.append(f"{t['name']} {t['artists'][0]['name']}")
+                songs = await fetch_multiple_song_metadata(queries)
+                if songs:
+                    queue.extend(songs)
+                    if is_playing:
+                        embed = discord.Embed(title="🟢 Added Playlist from Spotify", description=f"Added **{len(songs)}** tracks from playlist!", color=discord.Color.green())
+                        await ctx.send(embed=embed)
+                else:
+                    embed = discord.Embed(title="❌ Spotify Playlist Error", description="No playable tracks found in this Spotify playlist. All may be unavailable or blocked.", color=discord.Color.red())
                     await ctx.send(embed=embed)
         except Exception as e:
             embed = discord.Embed(title="❌ Spotify Error", description=f"Error processing Spotify link.\n```{str(e)}```", color=discord.Color.red())
             await ctx.send(embed=embed)
             return
     else:
-        queue.append(query)
-        # Detect if query is a link (URL)
-        is_url = isinstance(query, str) and re.match(r"https?://", query)
-        is_ytmusic = isinstance(query, str) and re.match(r"https?://music\.youtube\.com/", query)
-        is_search = not is_url
+        # Always fetch metadata and store as song object
+        song = await fetch_song_metadata(query)
+        queue.append(song)
         if is_playing:
-            if is_url:
-                from yt_dlp import YoutubeDL
-                ydl_opts = {
-                    'format': 'bestaudio',
-                    'noplaylist': True,
-                    'quiet': True,
-                }
-                async def fetch_metadata():
-                    try:
-                        def ytdlp_extract():
-                            with YoutubeDL(ydl_opts) as ydl:
-                                info = ydl.extract_info(query, download=False)
-                                if 'entries' in info:
-                                    info = info['entries'][0]
-                                return info
-                        info = await asyncio.to_thread(ytdlp_extract)
-                        title = info.get('title', query)
-                        url = info.get('webpage_url', query)
-                        embed = discord.Embed(title="➕ Added to Queue", description=f"**[{title}]({url})**", color=discord.Color.blurple())
-                        if 'thumbnail' in info:
-                            embed.set_thumbnail(url=info['thumbnail'])
-                        await ctx.send(embed=embed)
-                    except Exception as e:
-                        embed = discord.Embed(title="➕ Added to Queue", description=f"**{query}**", color=discord.Color.blurple())
-                        await ctx.send(embed=embed)
-                await fetch_metadata()
-            elif is_ytmusic or (is_search and 'music.youtube.com' in query):
-                embed = discord.Embed(title="➕ Added from YouTube Music", description=f"**{query}**", color=discord.Color.red())
-                await ctx.send(embed=embed)
-            else:
-                embed = discord.Embed(title="➕ Added to Queue", description=f"**{query}**", color=discord.Color.blurple())
-                await ctx.send(embed=embed)
+            embed = discord.Embed(title="➕ Added to Queue", description=f"**[{song['title']}]({song['webpage_url']})**", color=discord.Color.blurple())
+            if song['thumbnail']:
+                embed.set_thumbnail(url=song['thumbnail'])
+            await ctx.send(embed=embed)
     if not ctx.voice_client or not ctx.voice_client.is_playing():
         if ctx.voice_client is None:
             if ctx.author.voice:
@@ -410,6 +635,8 @@ async def play(ctx, *, query):
                 await ctx.send("You are not in a voice channel.")
                 return
         play_next(ctx)
+
+# (Removed duplicate replay command definition)
 
 @bot.command(aliases=["m!pa", "pa"])
 async def pause(ctx):
@@ -605,5 +832,17 @@ async def on_voice_state_update(member, before, after):
 # if is_elevator_enabled(ctx) and not getattr(ctx.bot, 'prevent_fallback', False):
 #    ctx.bot.elevator_task = ctx.bot.loop.create_task(play_elevator_music(ctx))
 
+# --- Web API Integration: Start FastAPI in a background thread ---
+def start_api(bot):
+    import threading
+    import uvicorn
+    import api
+    api.set_bot(bot)
+    def run():
+        uvicorn.run("api:app", host="0.0.0.0", port=8000, log_level="info")
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+
 if __name__ == '__main__':
+    start_api(bot)
     bot.run(TOKEN)
