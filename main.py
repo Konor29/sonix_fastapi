@@ -444,15 +444,7 @@ async def play_song(ctx, query_or_song, retry_count=0):
             'is_search': is_search,
             'query': query,
         }
-        # Add to queue if something is already playing
-        voice = ctx.voice_client
-        if voice and (voice.is_playing() or voice.is_paused()):
-            add_to_queue(ctx, song)
-            embed = discord.Embed(title="🎶 Queued", description=f"**[{title}]({info.get('webpage_url', '')})** was added to the queue.", color=discord.Color.blue())
-            if 'thumbnail' in info:
-                embed.set_thumbnail(url=info['thumbnail'])
-            await ctx.send(embed=embed)
-            return
+
     # If voice client is already playing, do not attempt playback or send error
     voice = ctx.voice_client
     if voice and voice.is_playing():
