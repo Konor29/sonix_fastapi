@@ -248,6 +248,7 @@ async def sonixhelp(ctx):
 import functools
 import concurrent.futures
 from collections import OrderedDict
+from invidious_helper import extract_video_id, get_invidious_audio_url, invidious_search
 
 # Global process pool for yt-dlp
 process_pool = concurrent.futures.ProcessPoolExecutor(max_workers=4)
