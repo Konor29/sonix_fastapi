@@ -5,3 +5,4 @@ fastapi
 uvicorn
 yt-dlp==2024.3.10
 spotipy==2.23.0
+PyNaCl
