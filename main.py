@@ -47,11 +47,12 @@ async def on_guild_join(guild):
 @bot.command()
 async def getkey(ctx):
     key = ensure_guild_key(ctx.guild.id)
+    guild_id = ctx.guild.id
     try:
-        await ctx.author.send(f"Your server's control key is: `{key}`\nKeep this secret!")
-        await ctx.reply("I've sent you the server key in a DM!", mention_author=False)
+        await ctx.author.send(f"Your server's control key is: `{key}`\nGuild ID: `{guild_id}`\nKeep this secret!")
+        await ctx.reply("I've sent you the server key and guild ID in a DM!", mention_author=False)
     except discord.Forbidden:
-        await ctx.reply(f"Your server's control key is: `{key}`\n(Enable DMs to receive this privately)", mention_author=False)
+        await ctx.reply(f"Your server's control key is: `{key}`\nGuild ID: `{guild_id}`\n(Enable DMs to receive this privately)", mention_author=False)
 
 # Song queue per guild (list of dicts with metadata)
 song_queues = {}  # {guild_id: [song_dict, ...]}
