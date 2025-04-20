@@ -752,18 +752,11 @@ async def skip(ctx):
     """Skips the current song and plays the next in queue."""
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.stop()
-        # Remove the current song from the queue
-        queue = get_queue(ctx)
-        if queue:
-            queue.pop(0)
         # Immediately clear playback flag and now_playing state to prevent race conditions
         if hasattr(ctx.bot, 'is_playing_flag'):
             ctx.bot.is_playing_flag[ctx.guild.id] = False
         now_playing[ctx.guild.id] = None
         await ctx.send("Skipped the song.")
-        # Play next song if queue is not empty
-        if queue:
-            await play_song(ctx, queue[0])
     else:
         await ctx.send("Nothing is playing to skip.")
 
