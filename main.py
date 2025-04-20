@@ -285,6 +285,10 @@ def ytdlp_extract(query, ydl_opts):
 
 async def fetch_song_metadata(q):
     from yt_dlp import YoutubeDL
+    import re
+    # If not a URL, prefix with ytsearch:
+    if not (isinstance(q, str) and re.match(r"https?://", q)):
+        q = f"ytsearch:{q}"
     ydl_opts = {
         'format': 'bestaudio',
         'noplaylist': True,
@@ -571,6 +575,21 @@ async def play(ctx, *, query):
     match = re.match(spotify_pattern, query)
     # Determine if the bot is already playing or paused
     is_playing = ctx.voice_client and (ctx.voice_client.is_playing() or ctx.voice_client.is_paused())
+
+    await ctx.send(f"[DEBUG] Fetching metadata for query: {query}")
+    logger.info(f"[DEBUG] Fetching metadata for query: {query}")
+    try:
+        song = await fetch_song_metadata(query)
+    except Exception as e:
+        await ctx.send(f"[DEBUG] Exception during metadata fetch: {e}")
+        logger.error(f"[DEBUG] Exception during metadata fetch: {e}")
+        song = None
+    if not song:
+        await ctx.send(f"[DEBUG] Metadata fetch failed for query: {query}")
+        logger.error(f"[DEBUG] Metadata fetch failed for query: {query}")
+        embed = discord.Embed(title="❌ Error", description="Could not find song metadata.", color=discord.Color.red())
+        await ctx.send(embed=embed)
+        return
 
 
     async def fetch_multiple_song_metadata(queries):
