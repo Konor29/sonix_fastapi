@@ -630,28 +630,42 @@ async def play(ctx, *, query):
             if song['thumbnail']:
                 embed.set_thumbnail(url=song['thumbnail'])
             await ctx.send(embed=embed)
-    # If already playing audio, just queue and send embed, do not trigger playback or error
+    # Check if the bot is already playing audio
     if ctx.voice_client and ctx.voice_client.is_playing():
-        # Fetch song metadata for the query
+        # Only add to queue if not already in queue
         song = await fetch_song_metadata(query)
-        if song:
+        queue = get_queue(ctx)
+        if song and not any(s.get('webpage_url') == song.get('webpage_url') for s in queue):
             add_to_queue(ctx, song)
             embed = discord.Embed(title="➕ Added to Queue", description=f"**[{song['title']}]({song['webpage_url']})**", color=discord.Color.blurple())
             if song['thumbnail']:
                 embed.set_thumbnail(url=song['thumbnail'])
             await ctx.send(embed=embed)
+        elif song:
+            embed = discord.Embed(title="⚠️ Already Queued", description=f"**[{song['title']}]({song['webpage_url']})** is already in the queue.", color=discord.Color.orange())
+            await ctx.send(embed=embed)
         else:
             embed = discord.Embed(title="❌ Error", description="Could not find song metadata.", color=discord.Color.red())
             await ctx.send(embed=embed)
         return
-    if not ctx.voice_client or not ctx.voice_client.is_playing():
-        if ctx.voice_client is None:
-            if ctx.author.voice:
-                await ctx.author.voice.channel.connect()
-            else:
-                await ctx.send("You are not in a voice channel.")
-                return
-        play_next(ctx)
+    # If nothing is playing, add to queue and start playback
+    song = await fetch_song_metadata(query)
+    if not song:
+        embed = discord.Embed(title="❌ Error", description="Could not find song metadata.", color=discord.Color.red())
+        await ctx.send(embed=embed)
+        return
+    add_to_queue(ctx, song)
+    if ctx.voice_client is None:
+        if ctx.author.voice:
+            await ctx.author.voice.channel.connect()
+        else:
+            await ctx.send("You are not in a voice channel.")
+            return
+    play_next(ctx)
+    embed = discord.Embed(title="🎶 Now Playing", description=f"**[{song['title']}]({song['webpage_url']})**", color=discord.Color.green())
+    if song['thumbnail']:
+        embed.set_thumbnail(url=song['thumbnail'])
+    await ctx.send(embed=embed)
 
 
 
