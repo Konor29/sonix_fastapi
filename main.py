@@ -248,6 +248,7 @@ async def sonixhelp(ctx):
 import functools
 import concurrent.futures
 from collections import OrderedDict
+from soundcloud_search import search_soundcloud
 
 # Global process pool for yt-dlp
 process_pool = concurrent.futures.ProcessPoolExecutor(max_workers=4)
@@ -581,9 +582,34 @@ async def join(ctx):
 
 @bot.command(aliases=["m!p", "p"])
 async def play(ctx, *, query):
-    """Adds a song or Spotify track/album/playlist to the queue or plays if nothing is playing."""
-    import logging
-    logger = logging.getLogger("sonix_debug")
+    """
+    Adds a song or Spotify track/album/playlist to the queue or plays if nothing is playing.
+    Usage: !play <song name or URL>
+    """
+    import soundcloud_search
+    # SoundCloud-first logic for YouTube links
+    youtube_regex = r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+"
+    if re.match(youtube_regex, query.strip()):
+        # Extract metadata with yt-dlp
+        song = await fetch_song_metadata(query)
+        if song and song.get('title'):
+            # Search SoundCloud for a matching track
+            search_query = song['title']
+            if song.get('artist'):
+                search_query += f" {song['artist']}"
+            sc_results = soundcloud_search.search_soundcloud(search_query, max_results=1)
+            if sc_results:
+                sc_track = sc_results[0]
+                # Play the SoundCloud track instead
+                sc_url = sc_track['url']
+                await ctx.send(f"🔊 Found on SoundCloud: [{sc_track['title']}]({sc_url}) by {sc_track['artist']}. Playing via SoundCloud instead of YouTube.")
+                # Replace query with SoundCloud URL
+                query = sc_url
+            else:
+                await ctx.send("⚠️ Could not find this song on SoundCloud. Attempting YouTube playback (may fail if cookies are invalid).")
+        else:
+            await ctx.send("❌ Could not extract metadata from the YouTube link. Please try a different link or search term.")
+    # ...logging.getLogger("sonix_debug")
     queue = get_queue(ctx)
     await ctx.send("[DEBUG] Play command called.")
     logger.info("[DEBUG] Play command called.")
