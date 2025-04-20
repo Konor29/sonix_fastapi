@@ -563,11 +563,18 @@ async def on_ready():
 @bot.command(aliases=["m!j", "j"])
 async def join(ctx):
     """Joins the voice channel you are in."""
+    import logging
+    logger = logging.getLogger("sonix_debug")
     if ctx.author.voice:
         channel = ctx.author.voice.channel
-        await channel.connect()
-        embed = discord.Embed(title="🔊 Joined Voice Channel", description=f"Joined **{channel}**!", color=discord.Color.blurple())
-        await ctx.send(embed=embed)
+        try:
+            await channel.connect()
+            embed = discord.Embed(title="🔊 Joined Voice Channel", description=f"Joined **{channel}**!", color=discord.Color.blurple())
+            await ctx.send(embed=embed)
+        except Exception as e:
+            logger.error(f"[DEBUG] Failed to join voice channel: {e}")
+            embed = discord.Embed(title="❌ Error", description=f"Failed to join voice channel: `{e}`", color=discord.Color.red())
+            await ctx.send(embed=embed)
     else:
         embed = discord.Embed(title="❌ Error", description="You are not in a voice channel.", color=discord.Color.red())
         await ctx.send(embed=embed)
