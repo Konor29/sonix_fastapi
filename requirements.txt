@@ -1,8 +1,8 @@
 discord.py
-yt-dlp
+yt-dlp>=2024.04.09
 dotenv
 fastapi
 uvicorn
-yt-dlp==2024.3.10
+yt-dlp>=2024.04.09>=2024.04.09
 spotipy==2.23.0
 PyNaCl
