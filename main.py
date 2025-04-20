@@ -453,6 +453,11 @@ async def play_song(ctx, query_or_song, retry_count=0):
                 embed.set_thumbnail(url=info['thumbnail'])
             await ctx.send(embed=embed)
             return
+    # If voice client is already playing, do not attempt playback or send error
+    voice = ctx.voice_client
+    if voice and voice.is_playing():
+        logger.info(f"[Sonix] play_song called but audio is already playing. Suppressing error.")
+        return
     try:
         logger.info(f"[Sonix] Starting playback: {song['title']}")
         source = await discord.FFmpegOpusAudio.from_probe(
@@ -698,6 +703,10 @@ async def skip(ctx):
     """Skips the current song and plays the next in queue."""
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.stop()
+        # Immediately clear playback flag and now_playing state to prevent race conditions
+        if hasattr(ctx.bot, 'is_playing_flag'):
+            ctx.bot.is_playing_flag[ctx.guild.id] = False
+        now_playing[ctx.guild.id] = None
         await ctx.send("Skipped the song.")
     else:
         await ctx.send("Nothing is playing to skip.")
