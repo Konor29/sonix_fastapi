@@ -630,6 +630,20 @@ async def play(ctx, *, query):
             if song['thumbnail']:
                 embed.set_thumbnail(url=song['thumbnail'])
             await ctx.send(embed=embed)
+    # If already playing audio, just queue and send embed, do not trigger playback or error
+    if ctx.voice_client and ctx.voice_client.is_playing():
+        # Fetch song metadata for the query
+        song = await fetch_song_metadata(query)
+        if song:
+            add_to_queue(ctx, song)
+            embed = discord.Embed(title="➕ Added to Queue", description=f"**[{song['title']}]({song['webpage_url']})**", color=discord.Color.blurple())
+            if song['thumbnail']:
+                embed.set_thumbnail(url=song['thumbnail'])
+            await ctx.send(embed=embed)
+        else:
+            embed = discord.Embed(title="❌ Error", description="Could not find song metadata.", color=discord.Color.red())
+            await ctx.send(embed=embed)
+        return
     if not ctx.voice_client or not ctx.voice_client.is_playing():
         if ctx.voice_client is None:
             if ctx.author.voice:
@@ -638,6 +652,7 @@ async def play(ctx, *, query):
                 await ctx.send("You are not in a voice channel.")
                 return
         play_next(ctx)
+
 
 
 # (Removed duplicate replay command definition)
