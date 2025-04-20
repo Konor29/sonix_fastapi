@@ -290,6 +290,7 @@ async def fetch_song_metadata(q):
         'noplaylist': True,
         'quiet': True,
         'default_search': 'ytsearch',
+        'cookiefile': 'youtube_cookies.txt',
     }
     def ytdlp_extract():
         try:
@@ -407,6 +408,7 @@ async def play_song(ctx, query_or_song, retry_count=0):
             'quiet': True,
             'default_search': 'ytsearch' if is_search else None,
             'outtmpl': 'song.%(ext)s',
+            'cookiefile': 'youtube_cookies.txt',
         }
         # Check cache first
         cached = get_cached_ytdlp(query)
