@@ -21,21 +21,27 @@ app.add_middleware(
 
 @app.get("/api/channels")
 async def get_channels(server_key: str):
-    # Look up guild_id from server_key
+    import logging
+    logging.warning(f"get_channels called with server_key={server_key}")
     from key_utils import get_guild_id_from_key
     guild_id = get_guild_id_from_key(server_key)
+    logging.warning(f"guild_id from key: {guild_id}")
     if not guild_id:
+        logging.error("Invalid server key")
         raise HTTPException(status_code=404, detail="Invalid server key")
     if not bot_instance:
+        logging.error("Bot not initialized")
         raise HTTPException(status_code=500, detail="Bot not initialized")
     guild = bot_instance.get_guild(int(guild_id))
+    logging.warning(f"guild from bot_instance: {guild}")
     if not guild:
+        logging.error("Guild not found")
         raise HTTPException(status_code=404, detail="Guild not found")
-    # Only return voice channels
     channels = [
         {"id": str(ch.id), "name": ch.name}
         for ch in getattr(guild, "voice_channels", [])
     ]
+    logging.warning(f"channels: {channels}")
     return {"channels": channels, "guild_id": str(guild_id)}
 
 # Reference to the bot instance (set from main.py)
