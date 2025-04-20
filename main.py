@@ -598,6 +598,8 @@ async def play(ctx, *, query):
     Adds a song or Spotify track/album/playlist to the queue or plays if nothing is playing.
     Usage: !play <song name or URL>
     """
+    import logging
+    logger = logging.getLogger("sonix_debug")
     queue = get_queue(ctx)
     await ctx.send("[DEBUG] Play command called.")
     logger.info("[DEBUG] Play command called.")
