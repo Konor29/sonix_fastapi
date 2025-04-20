@@ -689,7 +689,6 @@ async def play(ctx, *, query):
         # Only add to queue if not already in queue
         song = await fetch_song_metadata(query)
         queue = get_queue(ctx)
-        if song and not any(s.get('webpage_url') == song.get('webpage_url') for s in queue):
             add_to_queue(ctx, song)
             embed = discord.Embed(title="➕ Added to Queue", description=f"**[{song['title']}]({song['webpage_url']})**", color=discord.Color.blurple())
             if song['thumbnail']:
