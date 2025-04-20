@@ -605,13 +605,16 @@ async def play(ctx, *, query):
     if ctx.voice_client is None:
         if ctx.author.voice and ctx.author.voice.channel:
             await ctx.send("[DEBUG] Joining your voice channel...")
-            logger.info("[DEBUG] Joining user's voice channel...")
-            await ctx.author.voice.channel.connect()
-            await ctx.send("[DEBUG] Joined your voice channel.")
-            logger.info("[DEBUG] Joined user's voice channel.")
+            try:
+                await ctx.author.voice.channel.connect()
+                await ctx.send(f"[DEBUG] Joined voice channel: {ctx.author.voice.channel}")
+            except Exception as e:
+                await ctx.send(f"❌ Failed to join voice channel: `{e}`")
+                import logging
+                logging.getLogger("sonix_debug").error(f"[DEBUG] Failed to join voice channel: {e}")
+                return
         else:
             await ctx.send("You are not in a voice channel.")
-            logger.warning("[DEBUG] User not in a voice channel.")
             return
     # Check if query is a Spotify link
     spotify_pattern = r"https://open\.spotify\.com/(track|album|playlist)/([a-zA-Z0-9]+)"
