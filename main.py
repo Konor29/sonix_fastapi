@@ -248,7 +248,6 @@ async def sonixhelp(ctx):
 import functools
 import concurrent.futures
 from collections import OrderedDict
-from soundcloud_search import search_soundcloud
 
 # Global process pool for yt-dlp
 process_pool = concurrent.futures.ProcessPoolExecutor(max_workers=4)
@@ -430,12 +429,25 @@ async def play_song(ctx, query_or_song, retry_count=0):
         is_ytmusic = isinstance(query, str) and re.match(r"https?://music\.youtube\.com/", query)
         is_search = not (isinstance(query, str) and re.match(r"https?://", query))
         ydl_opts = {
-            'format': 'bestaudio',
-            'noplaylist': True,
+            'format': 'bestaudio/best',
             'quiet': True,
+            'noplaylist': True,
             'default_search': 'ytsearch' if is_search else None,
-            'outtmpl': 'song.%(ext)s',
+            'nocheckcertificate': True,
+            'extract_flat': 'in_playlist',
             'cookiefile': 'youtube_cookies.txt',
+            'outtmpl': '%(title)s.%(ext)s',
+            'cachedir': False,
+            'source_address': '0.0.0.0',  # Bind to IPv4
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Connection': 'keep-alive',
+                'DNT': '1',
+                'Upgrade-Insecure-Requests': '1',
+            },
         }
         # Check cache first
         cached = get_cached_ytdlp(query)
@@ -586,30 +598,6 @@ async def play(ctx, *, query):
     Adds a song or Spotify track/album/playlist to the queue or plays if nothing is playing.
     Usage: !play <song name or URL>
     """
-    import soundcloud_search
-    # SoundCloud-first logic for YouTube links
-    youtube_regex = r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+"
-    if re.match(youtube_regex, query.strip()):
-        # Extract metadata with yt-dlp
-        song = await fetch_song_metadata(query)
-        if song and song.get('title'):
-            # Search SoundCloud for a matching track
-            search_query = song['title']
-            if song.get('artist'):
-                search_query += f" {song['artist']}"
-            sc_results = soundcloud_search.search_soundcloud(search_query, max_results=1)
-            if sc_results:
-                sc_track = sc_results[0]
-                # Play the SoundCloud track instead
-                sc_url = sc_track['url']
-                await ctx.send(f"🔊 Found on SoundCloud: [{sc_track['title']}]({sc_url}) by {sc_track['artist']}. Playing via SoundCloud instead of YouTube.")
-                # Replace query with SoundCloud URL
-                query = sc_url
-            else:
-                await ctx.send("⚠️ Could not find this song on SoundCloud. Attempting YouTube playback (may fail if cookies are invalid).")
-        else:
-            await ctx.send("❌ Could not extract metadata from the YouTube link. Please try a different link or search term.")
-    # ...logging.getLogger("sonix_debug")
     queue = get_queue(ctx)
     await ctx.send("[DEBUG] Play command called.")
     logger.info("[DEBUG] Play command called.")
