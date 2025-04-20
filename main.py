@@ -286,9 +286,24 @@ def ytdlp_extract(query, ydl_opts):
 async def fetch_song_metadata(q):
     from yt_dlp import YoutubeDL
     import re
+    import logging
     # If not a URL, prefix with ytsearch:
     if not (isinstance(q, str) and re.match(r"https?://", q)):
         q = f"ytsearch:{q}"
+    logger = logging.getLogger("sonix_debug")
+    # Print the exact query being sent to yt-dlp
+    try:
+        import inspect
+        calling_ctx = None
+        for frame in inspect.stack():
+            if 'ctx' in frame.frame.f_locals:
+                calling_ctx = frame.frame.f_locals['ctx']
+                break
+        if calling_ctx:
+            await calling_ctx.send(f"[DEBUG] fetch_song_metadata is sending query to yt-dlp: {q}")
+        logger.info(f"[DEBUG] fetch_song_metadata is sending query to yt-dlp: {q}")
+    except Exception as e:
+        logger.error(f"[DEBUG] Could not send debug message for query: {e}")
     ydl_opts = {
         'format': 'bestaudio',
         'noplaylist': True,
@@ -303,8 +318,15 @@ async def fetch_song_metadata(q):
                 if 'entries' in info:
                     info = info['entries'][0]
                 return info
-        except Exception:
-            return None  # Always return None on failure, never an exception or traceback
+        except Exception as e:
+            logger.error(f"[DEBUG] yt-dlp exception: {e}")
+            try:
+                if calling_ctx:
+                    import asyncio
+                    asyncio.run(calling_ctx.send(f"[DEBUG] yt-dlp exception: {e}"))
+            except Exception:
+                pass
+            return None
     info = await asyncio.to_thread(ytdlp_extract)
     if not info:
         return None
@@ -730,11 +752,18 @@ async def skip(ctx):
     """Skips the current song and plays the next in queue."""
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.stop()
+        # Remove the current song from the queue
+        queue = get_queue(ctx)
+        if queue:
+            queue.pop(0)
         # Immediately clear playback flag and now_playing state to prevent race conditions
         if hasattr(ctx.bot, 'is_playing_flag'):
             ctx.bot.is_playing_flag[ctx.guild.id] = False
         now_playing[ctx.guild.id] = None
         await ctx.send("Skipped the song.")
+        # Play next song if queue is not empty
+        if queue:
+            await play_song(ctx, queue[0])
     else:
         await ctx.send("Nothing is playing to skip.")
 
