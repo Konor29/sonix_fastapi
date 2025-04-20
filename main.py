@@ -696,18 +696,18 @@ async def play(ctx, *, query):
         # Only add to queue if not already in queue
         song = await fetch_song_metadata(query)
         queue = get_queue(ctx)
-            add_to_queue(ctx, song)
-            embed = discord.Embed(title="➕ Added to Queue", description=f"**[{song['title']}]({song['webpage_url']})**", color=discord.Color.blurple())
-            if song['thumbnail']:
-                embed.set_thumbnail(url=song['thumbnail'])
-            await ctx.send(embed=embed)
-        elif song:
-            embed = discord.Embed(title="⚠️ Already Queued", description=f"**[{song['title']}]({song['webpage_url']})** is already in the queue.", color=discord.Color.orange())
-            await ctx.send(embed=embed)
-        else:
-            embed = discord.Embed(title="❌ Error", description="Could not find song metadata.", color=discord.Color.red())
-            await ctx.send(embed=embed)
-        return
+    add_to_queue(ctx, song)
+    embed = discord.Embed(title="➕ Added to Queue", description=f"**[{song['title']}]({song['webpage_url']})**", color=discord.Color.blurple())
+    if song['thumbnail']:
+        embed.set_thumbnail(url=song['thumbnail'])
+    await ctx.send(embed=embed)
+    elif song:
+        embed = discord.Embed(title="⚠️ Already Queued", description=f"**[{song['title']}]({song['webpage_url']})** is already in the queue.", color=discord.Color.orange())
+        await ctx.send(embed=embed)
+    else:
+        embed = discord.Embed(title="❌ Error", description="Could not find song metadata.", color=discord.Color.red())
+        await ctx.send(embed=embed)
+    return
     # If nothing is playing, add to queue and start playback
     song = await fetch_song_metadata(query)
     if not song:
